@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 from dotenv import load_dotenv
 from strands import Agent, tool
 from strands_tools import calculator, current_time
@@ -38,3 +39,19 @@ I have 4 requests:
 3. Tell me how many letter R's are in the word "strawberry" 🍓
 """
 agent(message)
+=======
+from strands import Agent
+# from strands_tools import http_request
+from dotenv import load_dotenv
+
+load_dotenv()
+
+recipe_agent = Agent(
+    model="us.anthropic.claude-sonnet-4-20250514-v1:0",
+    system_prompt="You are a RecipeBot, an expert in cooking and recipes. You can provide recipes, cooking tips, and meal ideas based on user preferences.",
+)
+
+response = recipe_agent("Suggest a recipe for a vegetarian dinner with ingredients I have at home.")
+
+print(response)
+>>>>>>> 6a992a5ebe80b831c53a0435843389b60dc215ca
