@@ -1,0 +1,766 @@
+import json
+import logging
+from typing import Dict, Any, List, Optional
+from datetime import datetime, date, timedelta
+
+from models import (
+    AgentResponse, UserProfile, UserInventory, MealPlan, 
+    Meal, Recipe, FoodItem, MealType, CookingSkillLevel
+)
+from bedrock_client import bedrock_client
+from database import db
+
+logger = logging.getLogger(__name__)
+
+class MealPlanningAgent:
+    """
+    Main agent responsible for creating optimized meal plans
+    """
+    
+    def __init__(self):
+        self.agent_name = "MealPlanning"
+        self.system_prompt = self._get_system_prompt()
+    
+    def _get_system_prompt(self) -> str:
+        return """You are the Meal Planning Agent for "Good Food to You", an AI system designed to reduce food waste and simplify meal planning. Your role is to create personalized, nutritionally balanced meal plans using ingredients users already have.
+
+Your responsibilities:
+1. Create 3-7 day meal plans prioritizing ingredients near expiration
+2. Ensure nutritional balance across all meals
+3. Respect dietary restrictions and health conditions
+4. Consider cooking time preferences and skill level
+5. Minimize food waste by maximizing ingredient utilization
+
+Always respond with valid JSON in this exact format:
+{
+  "meal_plan": {
+    "plan_duration_days": number,
+    "meals": [
+      {
+        "day": number,
+        "meal_type": "breakfast|lunch|dinner|snack",
+        "recipe": {
+          "name": "recipe name",
+          "ingredients": ["ingredient list"],
+          "instructions": ["step by step instructions"],
+          "prep_time_minutes": number,
+          "cooking_time_minutes": number,
+          "servings": number,
+          "difficulty_level": "beginner|intermediate|advanced",
+          "nutrition_estimate": {
+            "calories": "estimate",
+            "protein": "estimate", 
+            "carbs": "estimate",
+            "fat": "estimate"
+          },
+          "tags": ["cuisine", "dietary", "method"]
+        },
+        "ingredients_used_from_inventory": ["list of inventory items used"],
+        "waste_reduction_notes": "how this meal reduces waste"
+      }
+    ],
+    "shopping_list": [
+      {
+        "item": "item name",
+        "quantity": "amount needed",
+        "estimated_cost": "cost estimate",
+        "priority": "high|medium|low"
+      }
+    ],
+    "waste_reduction_summary": {
+      "items_used_before_expiry": ["list"],
+      "total_items_utilized": number,
+      "estimated_waste_prevented": "description"
+    },
+    "nutritional_highlights": [
+      "key nutritional benefits of this meal plan"
+    ],
+    "prep_tips": [
+      "meal prep and time-saving suggestions"
+    ]
+  },
+  "follow_up_questions": [
+    "2-3 questions to improve future recommendations"
+  ],
+  "confidence_score": 0.0-1.0
+}
+
+Remember: Your goal is to make healthy eating effortless while minimizing waste and respecting the user's lifestyle constraints."""
+
+    async def create_meal_plan(
+        self, 
+        user_profile: UserProfile,
+        user_inventory: UserInventory,
+        user_request: str,
+        plan_days: int = 7
+    ) -> AgentResponse:
+        """
+        Create a comprehensive meal plan for the user
+        """
+        try:
+            # Build comprehensive context
+            context = self._build_planning_context(
+                user_profile, user_inventory, user_request, plan_days
+            )
+            
+            # Invoke the model
+            response = await bedrock_client.invoke_with_retry(
+                prompt=context,
+                agent_name=self.agent_name,
+                system_prompt=self.system_prompt,
+                temperature=0.3,  # Slightly higher for creativity
+                max_tokens=6000   # Longer for detailed meal plans
+            )
+            
+            if not response.success:
+                return response
+            
+            # Process the meal plan response
+            return await self._process_meal_plan_response(
+                response.data, user_profile, user_inventory
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in MealPlanning create_meal_plan: {str(e)}")
+            return AgentResponse(
+                agent_name=self.agent_name,
+                success=False,
+                errors=[f"Meal planning error: {str(e)}"]
+            )
+    
+    def _build_planning_context(
+        self, 
+        user_profile: UserProfile,
+        user_inventory: UserInventory,
+        user_request: str,
+        plan_days: int
+    ) -> str:
+        """
+        Build comprehensive context for meal planning
+        """
+        context_parts = []
+        
+        # User profile section
+        context_parts.append("## User Profile:")
+        context_parts.append(f"Household Size: {user_profile.household_size}")
+        context_parts.append(f"Age Group: {user_profile.age_group}")
+        context_parts.append(f"Activity Level: {user_profile.activity_level}")
+        
+        # Food preferences
+        if user_profile.food_preferences:
+            context_parts.append(f"Food Preferences: {', '.join(user_profile.food_preferences)}")
+        if user_profile.food_dislikes:
+            context_parts.append(f"Food Dislikes: {', '.join(user_profile.food_dislikes)}")
+        
+        # Dietary restrictions and health conditions
+        if user_profile.dietary_restrictions:
+            restrictions = [dr.value for dr in user_profile.dietary_restrictions]
+            context_parts.append(f"Dietary Restrictions: {', '.join(restrictions)}")
+        
+        if user_profile.health_conditions:
+            conditions = [hc.value for hc in user_profile.health_conditions]
+            context_parts.append(f"Health Conditions: {', '.join(conditions)}")
+        
+        # Cooking preferences
+        cooking_prefs = user_profile.cooking_preferences
+        context_parts.append(f"Cooking Skill Level: {cooking_prefs.skill_level.value}")
+        context_parts.append(f"Available Cooking Time: {cooking_prefs.available_time_minutes} minutes")
+        context_parts.append(f"Meal Prep Style: {cooking_prefs.meal_prep_style}")
+        
+        if cooking_prefs.preferred_cuisines:
+            context_parts.append(f"Preferred Cuisines: {', '.join(cooking_prefs.preferred_cuisines)}")
+        
+        if cooking_prefs.kitchen_equipment:
+            context_parts.append(f"Available Equipment: {', '.join(cooking_prefs.kitchen_equipment)}")
+        
+        # Current inventory with priority
+        context_parts.append("\n## Current Food Inventory:")
+        if user_inventory and user_inventory.items:
+            # Sort by priority (expiring items first)
+            sorted_items = sorted(user_inventory.items, key=lambda x: (
+                x.expiry_date if x.expiry_date else date.max,
+                -x.priority
+            ))
+            
+            expiring_soon = []
+            regular_items = []
+            
+            for item in sorted_items:
+                item_desc = f"{item.name} ({item.quantity} {item.unit})"
+                if item.expiry_date:
+                    days_until_expiry = (item.expiry_date - date.today()).days
+                    if days_until_expiry <= 3:
+                        expiring_soon.append(f"{item_desc} - expires {item.expiry_date}")
+                    else:
+                        regular_items.append(f"{item_desc} - expires {item.expiry_date}")
+                else:
+                    regular_items.append(item_desc)
+            
+            if expiring_soon:
+                context_parts.append("### PRIORITY - Items Expiring Soon (USE FIRST):")
+                for item in expiring_soon[:10]:  # Limit for token management
+                    context_parts.append(f"- {item}")
+            
+            if regular_items:
+                context_parts.append("### Other Available Items:")
+                for item in regular_items[:15]:  # Limit for token management
+                    context_parts.append(f"- {item}")
+        else:
+            context_parts.append("No current inventory available")
+        
+        # User request
+        context_parts.append(f"\n## User Request:")
+        context_parts.append(user_request)
+        
+        # Planning parameters
+        context_parts.append(f"\n## Planning Parameters:")
+        context_parts.append(f"Plan Duration: {plan_days} days")
+        context_parts.append(f"Target Date Range: {date.today()} to {date.today() + timedelta(days=plan_days-1)}")
+        
+        # Instructions
+        context_parts.append("\n## Planning Instructions:")
+        context_parts.append("1. PRIORITIZE expiring items - use them in the first 1-2 days")
+        context_parts.append("2. Create recipes that use multiple inventory items efficiently")
+        context_parts.append("3. Ensure nutritional balance across the entire plan")
+        context_parts.append("4. Match complexity to user's available time and skill level")
+        context_parts.append("5. Suggest ingredient prep techniques to extend shelf life")
+        context_parts.append("6. Include variety while respecting preferences")
+        context_parts.append("7. Minimize shopping list by maximizing inventory usage")
+        context_parts.append("8. Consider batch cooking opportunities")
+        
+        return "\n".join(context_parts)
+    
+    async def _process_meal_plan_response(
+        self,
+        agent_data: Dict[str, Any],
+        user_profile: UserProfile,
+        user_inventory: UserInventory
+    ) -> AgentResponse:
+        """
+        Process and validate the meal plan response
+        """
+        try:
+            # Extract JSON if needed
+            if 'raw_response' in agent_data:
+                parsed_data = bedrock_client.extract_json_from_response(agent_data['raw_response'])
+                if parsed_data:
+                    agent_data = parsed_data
+                else:
+                    return AgentResponse(
+                        agent_name=self.agent_name,
+                        success=False,
+                        errors=["Could not parse meal plan response as JSON"]
+                    )
+            
+            # Validate meal plan structure
+            if 'meal_plan' not in agent_data:
+                return AgentResponse(
+                    agent_name=self.agent_name,
+                    success=False,
+                    errors=["Invalid meal plan format - missing meal_plan field"]
+                )
+            
+            meal_plan_data = agent_data['meal_plan']
+            
+            # Create structured meal plan object
+            meal_plan = await self._create_structured_meal_plan(
+                meal_plan_data, user_profile, user_inventory
+            )
+            
+            # Calculate additional metrics
+            metrics = self._calculate_plan_metrics(meal_plan_data, user_inventory)
+            
+            processed_data = {
+                'meal_plan': meal_plan.to_dict() if meal_plan else meal_plan_data,
+                'raw_plan_data': meal_plan_data,
+                'metrics': metrics,
+                'follow_up_questions': agent_data.get('follow_up_questions', []),
+                'recommendations': self._generate_implementation_tips(meal_plan_data)
+            }
+            
+            return AgentResponse(
+                agent_name=self.agent_name,
+                success=True,
+                data=processed_data,
+                confidence_score=agent_data.get('confidence_score', 0.8)
+            )
+            
+        except Exception as e:
+            logger.error(f"Error processing meal plan response: {str(e)}")
+            return AgentResponse(
+                agent_name=self.agent_name,
+                success=False,
+                errors=[f"Response processing error: {str(e)}"]
+            )
+    
+    async def _create_structured_meal_plan(
+        self,
+        plan_data: Dict[str, Any],
+        user_profile: UserProfile,
+        user_inventory: UserInventory
+    ) -> Optional[MealPlan]:
+        """
+        Create a structured MealPlan object from the agent response
+        """
+        try:
+            plan_days = plan_data.get('plan_duration_days', 7)
+            start_date = date.today()
+            end_date = start_date + timedelta(days=plan_days - 1)
+            
+            meals = []
+            for meal_data in plan_data.get('meals', []):
+                try:
+                    # Parse meal type
+                    meal_type = MealType(meal_data.get('meal_type', 'dinner'))
+                    
+                    # Parse recipe data
+                    recipe_data = meal_data.get('recipe', {})
+                    
+                    # Determine difficulty level
+                    difficulty_str = recipe_data.get('difficulty_level', 'intermediate')
+                    try:
+                        difficulty = CookingSkillLevel(difficulty_str)
+                    except ValueError:
+                        difficulty = CookingSkillLevel.INTERMEDIATE
+                    
+                    recipe = Recipe(
+                        name=recipe_data.get('name', 'Unnamed Recipe'),
+                        ingredients=recipe_data.get('ingredients', []),
+                        instructions=recipe_data.get('instructions', []),
+                        cooking_time_minutes=recipe_data.get('cooking_time_minutes', 30),
+                        prep_time_minutes=recipe_data.get('prep_time_minutes', 15),
+                        servings=recipe_data.get('servings', user_profile.household_size),
+                        difficulty_level=difficulty,
+                        nutrition_info=recipe_data.get('nutrition_estimate', {}),
+                        tags=recipe_data.get('tags', [])
+                    )
+                    
+                    # Calculate scheduled date
+                    day_offset = meal_data.get('day', 1) - 1
+                    scheduled_date = start_date + timedelta(days=day_offset)
+                    
+                    # Map ingredients used from inventory
+                    ingredients_used = []
+                    used_from_inventory = meal_data.get('ingredients_used_from_inventory', [])
+                    
+                    if user_inventory:
+                        for inventory_item in user_inventory.items:
+                            if inventory_item.name in used_from_inventory:
+                                ingredients_used.append(inventory_item)
+                    
+                    meal = Meal(
+                        meal_type=meal_type,
+                        recipe=recipe,
+                        scheduled_date=scheduled_date,
+                        ingredients_used=ingredients_used
+                    )
+                    
+                    meals.append(meal)
+                    
+                except Exception as meal_error:
+                    logger.warning(f"Error parsing meal data: {str(meal_error)}")
+                    continue
+            
+            # Create shopping list
+            shopping_list = []
+            for item_data in plan_data.get('shopping_list', []):
+                shopping_item = FoodItem(
+                    name=item_data.get('item', 'Unknown Item'),
+                    quantity=item_data.get('quantity', '1'),
+                    unit='piece',  # Default unit
+                    priority=1 if item_data.get('priority') == 'high' else 0
+                )
+                shopping_list.append(shopping_item)
+            
+            meal_plan = MealPlan(
+                plan_id="",  # Will be generated in __post_init__
+                user_id=user_profile.user_id,
+                start_date=start_date,
+                end_date=end_date,
+                meals=meals,
+                shopping_list=shopping_list,
+                waste_reduction_tips=plan_data.get('prep_tips', []),
+                nutritional_summary=self._create_nutritional_summary(plan_data)
+            )
+            
+            return meal_plan
+            
+        except Exception as e:
+            logger.error(f"Error creating structured meal plan: {str(e)}")
+            return None
+    
+    def _calculate_plan_metrics(
+        self, 
+        plan_data: Dict[str, Any], 
+        user_inventory: UserInventory
+    ) -> Dict[str, Any]:
+        """
+        Calculate useful metrics about the meal plan
+        """
+        metrics = {
+            'total_meals': len(plan_data.get('meals', [])),
+            'inventory_utilization': 0,
+            'estimated_prep_time': 0,
+            'cuisine_variety': [],
+            'difficulty_distribution': {},
+            'waste_prevention_score': 0
+        }
+        
+        try:
+            meals = plan_data.get('meals', [])
+            
+            # Calculate total prep time
+            total_prep_time = 0
+            total_cook_time = 0
+            
+            # Track difficulty levels
+            difficulty_counts = {}
+            
+            # Track cuisine variety
+            cuisines = set()
+            
+            for meal in meals:
+                recipe = meal.get('recipe', {})
+                
+                # Time calculations
+                prep_time = recipe.get('prep_time_minutes', 15)
+                cook_time = recipe.get('cooking_time_minutes', 30)
+                total_prep_time += prep_time
+                total_cook_time += cook_time
+                
+                # Difficulty tracking
+                difficulty = recipe.get('difficulty_level', 'intermediate')
+                difficulty_counts[difficulty] = difficulty_counts.get(difficulty, 0) + 1
+                
+                # Cuisine tracking
+                tags = recipe.get('tags', [])
+                for tag in tags:
+                    if tag.lower() in ['italian', 'asian', 'mexican', 'indian', 'mediterranean', 'american']:
+                        cuisines.add(tag)
+            
+            metrics['estimated_prep_time'] = total_prep_time + total_cook_time
+            metrics['difficulty_distribution'] = difficulty_counts
+            metrics['cuisine_variety'] = list(cuisines)
+            
+            # Calculate inventory utilization
+            if user_inventory and user_inventory.items:
+                total_items = len(user_inventory.items)
+                
+                # Count unique items used across all meals
+                used_items = set()
+                for meal in meals:
+                    ingredients_used = meal.get('ingredients_used_from_inventory', [])
+                    used_items.update(ingredients_used)
+                
+                if total_items > 0:
+                    metrics['inventory_utilization'] = len(used_items) / total_items
+            
+            # Calculate waste prevention score
+            waste_summary = plan_data.get('waste_reduction_summary', {})
+            items_saved = len(waste_summary.get('items_used_before_expiry', []))
+            total_utilized = waste_summary.get('total_items_utilized', 0)
+            
+            if total_utilized > 0:
+                metrics['waste_prevention_score'] = min(100, (items_saved / total_utilized) * 100)
+            
+        except Exception as e:
+            logger.error(f"Error calculating metrics: {str(e)}")
+            
+        return metrics
+    
+    def _create_nutritional_summary(self, plan_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Create a nutritional summary from the meal plan
+        """
+        summary = {
+            'highlights': plan_data.get('nutritional_highlights', []),
+            'estimated_daily_totals': {},
+            'food_group_coverage': {},
+            'dietary_compliance': True
+        }
+        
+        try:
+            meals = plan_data.get('meals', [])
+            daily_totals = {'calories': 0, 'protein': 0, 'carbs': 0, 'fat': 0}
+            
+            for meal in meals:
+                recipe = meal.get('recipe', {})
+                nutrition = recipe.get('nutrition_estimate', {})
+                
+                # Simple parsing of nutrition estimates
+                for nutrient, value in nutrition.items():
+                    if nutrient in daily_totals and isinstance(value, (int, float)):
+                        daily_totals[nutrient] += value
+            
+            # Average per day
+            plan_days = plan_data.get('plan_duration_days', 7)
+            if plan_days > 0:
+                for nutrient, total in daily_totals.items():
+                    summary['estimated_daily_totals'][nutrient] = total / plan_days
+            
+        except Exception as e:
+            logger.error(f"Error creating nutritional summary: {str(e)}")
+        
+        return summary
+    
+    def _generate_implementation_tips(self, plan_data: Dict[str, Any]) -> List[str]:
+        """
+        Generate practical tips for implementing the meal plan
+        """
+        tips = []
+        
+        try:
+            meals = plan_data.get('meals', [])
+            plan_days = plan_data.get('plan_duration_days', 7)
+            
+            # Time management tips
+            total_prep_time = sum(
+                meal.get('recipe', {}).get('prep_time_minutes', 0) + 
+                meal.get('recipe', {}).get('cooking_time_minutes', 0)
+                for meal in meals
+            )
+            
+            if total_prep_time > 0:
+                avg_daily_time = total_prep_time / plan_days
+                if avg_daily_time > 90:
+                    tips.append("Consider batch cooking on weekends - many recipes can be prepped in advance")
+                elif avg_daily_time < 30:
+                    tips.append("This is a time-efficient meal plan - perfect for busy weekdays")
+            
+            # Batch cooking opportunities
+            recipes_by_method = {}
+            for meal in meals:
+                recipe = meal.get('recipe', {})
+                tags = recipe.get('tags', [])
+                
+                for tag in tags:
+                    if tag.lower() in ['slow-cooker', 'one-pot', 'baking', 'roasting']:
+                        if tag not in recipes_by_method:
+                            recipes_by_method[tag] = []
+                        recipes_by_method[tag].append(recipe.get('name', 'Recipe'))
+            
+            if 'slow-cooker' in recipes_by_method:
+                tips.append("Set up slow-cooker meals in the morning for effortless dinners")
+            
+            if 'baking' in recipes_by_method or 'roasting' in recipes_by_method:
+                tips.append("Batch roast vegetables at the start of the week for multiple meals")
+            
+            # Ingredient prep suggestions
+            all_ingredients = set()
+            for meal in meals:
+                recipe = meal.get('recipe', {})
+                ingredients = recipe.get('ingredients', [])
+                all_ingredients.update(ingredients)
+            
+            # Common prep ingredients
+            prep_ingredients = ['onions', 'garlic', 'carrots', 'celery', 'bell peppers']
+            needs_prep = [ing for ing in prep_ingredients if any(prep_ing in ing.lower() for ing in all_ingredients)]
+            
+            if needs_prep:
+                tips.append(f"Pre-chop {', '.join(needs_prep[:3])} at the beginning of the week to save daily prep time")
+            
+            # Storage and freshness tips
+            waste_summary = plan_data.get('waste_reduction_summary', {})
+            items_expiring = waste_summary.get('items_used_before_expiry', [])
+            
+            if items_expiring:
+                tips.append("Store cut vegetables in airtight containers with paper towels to extend freshness")
+                tips.append("Use the 'first in, first out' principle - consume older items before newer ones")
+            
+            # Meal prep strategy based on difficulty
+            difficulty_counts = {}
+            for meal in meals:
+                difficulty = meal.get('recipe', {}).get('difficulty_level', 'intermediate')
+                difficulty_counts[difficulty] = difficulty_counts.get(difficulty, 0) + 1
+            
+            if difficulty_counts.get('advanced', 0) > 2:
+                tips.append("Schedule complex recipes for days when you have more time and energy")
+            
+            if difficulty_counts.get('beginner', 0) > 3:
+                tips.append("This plan has many simple recipes - perfect for building cooking confidence")
+            
+            # Shopping and organization tips
+            shopping_list = plan_data.get('shopping_list', [])
+            if shopping_list:
+                high_priority_items = [item for item in shopping_list if item.get('priority') == 'high']
+                if high_priority_items:
+                    tips.append("Shop for high-priority items first - these are needed for your earliest meals")
+                
+                tips.append("Organize your shopping list by store sections (produce, dairy, pantry) for efficient shopping")
+            
+            # Leftover management
+            large_batch_meals = [
+                meal for meal in meals 
+                if meal.get('recipe', {}).get('servings', 0) > 4
+            ]
+            
+            if large_batch_meals:
+                tips.append("Freeze half of large batch recipes for future quick meals")
+                tips.append("Transform leftovers - today's roast chicken becomes tomorrow's chicken salad")
+            
+            # Nutritional timing
+            breakfast_count = len([m for m in meals if m.get('meal_type') == 'breakfast'])
+            if breakfast_count > 0:
+                tips.append("Prep overnight oats or breakfast smoothie ingredients for grab-and-go mornings")
+            
+            # Add prep tips from the meal plan itself
+            plan_prep_tips = plan_data.get('prep_tips', [])
+            tips.extend(plan_prep_tips)
+            
+            # Ensure we have at least a few general tips
+            if len(tips) < 3:
+                tips.extend([
+                    "Read through all recipes before starting your week to identify shared ingredients",
+                    "Keep a running grocery list to capture items as you run out",
+                    "Take photos of successful meals to remember favorites for future planning"
+                ])
+            
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_tips = []
+            for tip in tips:
+                if tip not in seen:
+                    unique_tips.append(tip)
+                    seen.add(tip)
+            
+            return unique_tips[:10]  # Limit to top 10 most useful tips
+            
+        except Exception as e:
+            logger.error(f"Error generating implementation tips: {str(e)}")
+            return [
+                "Plan your shopping trip by organizing items by store section",
+                "Prep ingredients in batches to save time during the week",
+                "Keep backup quick meals for busy days"
+            ]
+    
+    async def suggest_meal_modifications(
+        self,
+        meal_plan: MealPlan,
+        user_feedback: Dict[str, Any],
+        user_profile: UserProfile
+    ) -> AgentResponse:
+        """
+        Suggest modifications to an existing meal plan based on user feedback
+        """
+        try:
+            modification_context = self._build_modification_context(
+                meal_plan, user_feedback, user_profile
+            )
+            
+            modification_prompt = f"""
+            Based on the user feedback, suggest specific modifications to improve their meal plan.
+            Focus on practical adjustments that address their concerns while maintaining nutritional balance.
+            
+            {modification_context}
+            
+            Provide response in JSON format:
+            {{
+              "modifications": [
+                {{
+                  "meal_day": number,
+                  "meal_type": "breakfast|lunch|dinner|snack",
+                  "modification_type": "replace|adjust|add",
+                  "current_recipe": "name",
+                  "suggested_change": "description",
+                  "reason": "why this change addresses feedback"
+                }}
+              ],
+              "alternative_recipes": [
+                {{
+                  "replaces": "original recipe name",
+                  "new_recipe": {{
+                    "name": "recipe name",
+                    "ingredients": ["list"],
+                    "instructions": ["steps"],
+                    "prep_time_minutes": number,
+                    "cooking_time_minutes": number,
+                    "difficulty_level": "beginner|intermediate|advanced"
+                  }}
+                }}
+              ],
+              "implementation_notes": ["helpful tips for implementing changes"]
+            }}
+            """
+            
+            response = await bedrock_client.invoke_with_retry(
+                prompt=modification_prompt,
+                agent_name=self.agent_name,
+                system_prompt="You are an expert meal planning assistant focused on adapting plans based on user feedback.",
+                temperature=0.2,
+                max_tokens=3000
+            )
+            
+            if not response.success:
+                return response
+            
+            # Process modification response
+            return self._process_modification_response(response.data)
+            
+        except Exception as e:
+            logger.error(f"Error suggesting meal modifications: {str(e)}")
+            return AgentResponse(
+                agent_name=self.agent_name,
+                success=False,
+                errors=[f"Modification error: {str(e)}"]
+            )
+    
+    def _build_modification_context(
+        self,
+        meal_plan: MealPlan,
+        user_feedback: Dict[str, Any],
+        user_profile: UserProfile
+    ) -> str:
+        """
+        Build context for meal plan modifications
+        """
+        context_parts = []
+        
+        context_parts.append("## Current Meal Plan:")
+        for meal in meal_plan.meals:
+            context_parts.append(f"Day {(meal.scheduled_date - meal_plan.start_date).days + 1}: {meal.meal_type.value} - {meal.recipe.name}")
+        
+        context_parts.append("\n## User Feedback:")
+        for key, value in user_feedback.items():
+            context_parts.append(f"{key}: {value}")
+        
+        context_parts.append("\n## User Constraints:")
+        context_parts.append(f"Cooking Skill: {user_profile.cooking_preferences.skill_level.value}")
+        context_parts.append(f"Available Time: {user_profile.cooking_preferences.available_time_minutes} minutes")
+        
+        if user_profile.dietary_restrictions:
+            restrictions = [dr.value for dr in user_profile.dietary_restrictions]
+            context_parts.append(f"Dietary Restrictions: {', '.join(restrictions)}")
+        
+        return "\n".join(context_parts)
+    
+    def _process_modification_response(self, agent_data: Dict[str, Any]) -> AgentResponse:
+        """
+        Process modification suggestions response
+        """
+        try:
+            # Extract JSON if needed
+            if 'raw_response' in agent_data:
+                parsed_data = bedrock_client.extract_json_from_response(agent_data['raw_response'])
+                if parsed_data:
+                    agent_data = parsed_data
+            
+            return AgentResponse(
+                agent_name=self.agent_name,
+                success=True,
+                data={
+                    'modifications': agent_data.get('modifications', []),
+                    'alternative_recipes': agent_data.get('alternative_recipes', []),
+                    'implementation_notes': agent_data.get('implementation_notes', [])
+                },
+                confidence_score=0.8
+            )
+            
+        except Exception as e:
+            logger.error(f"Error processing modification response: {str(e)}")
+            return AgentResponse(
+                agent_name=self.agent_name,
+                success=False,
+                errors=[f"Modification processing error: {str(e)}"]
+            )
+        
+meal_planning_agent = MealPlanningAgent()

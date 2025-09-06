@@ -5,8 +5,5 @@ strands-agents
 strands-agents-tools[mem0_memory]
 uv
 streamlit
-<<<<<<< HEAD
 strands-agents[litellm]
-=======
-strands-agents[litellm]
->>>>>>> 6a992a5ebe80b831c53a0435843389b60dc215ca
+fastapi

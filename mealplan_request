@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""
+Good Food to You - Meal Planning System
+Main entrypoint for the AI-powered meal planning application
+"""
+
+import os
+import sys
+import json
+import asyncio
+import logging
+import argparse
+from typing import Dict, Any, Optional
+from datetime import datetime
+from pathlib import Path
+
+# FastAPI imports for web API
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+import uvicorn
+
+# Internal imports
+from orchestrator import meal_planning_orchestrator, WorkflowStatus, AgentType
+from models import UserProfile
+from database import db
+from config import load_config
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('meal_planning.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Pydantic models for API requests
+class MealPlanRequest(BaseModel):
+    user_id: str
+    plan_days: int = Field(default=7, ge=1, le=14)
+    preferences: Dict[str, Any] = Field(default_factory=dict)
+    dietary_requirements: Optional[Dict[str, Any]] = None
+    cooking_constraints: Optional[Dict[str, Any]] = None
+    inventory_update: Optional[Dict[str, Any]] = None
+
+class FeedbackRequest(BaseModel):
+    user_id: str
+    meal_plan_id: Optional[str] = None
+    feedback_type: str = Field(..., regex="^(rating|preference|complaint|suggestion)$")
+    feedback_data: Dict[str, Any]
+    source: str = "api"
+
+class InventoryUpdateRequest(BaseModel):
+    user_id: str
+    inventory_data: Dict[str, Any]
+    update_type: str = Field(default="full", regex="^(full|partial|add|remove)$")
+
+class QuickRecipeRequest(BaseModel):
+    user_id: str
+    recipe_criteria: Dict[str, Any]
+    available_ingredients: Optional[list] = None
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Good Food to You - Meal Planning API",
+    description="AI-powered meal planning system focused on reducing food waste",
+    version="1.0.0"
+)
+
+# CORS middleware for web frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global state for system health
+system_health = {
+    "status": "initializing",
+    "last_health_check": None,
+    "active_workflows": 0,
+    "total_requests": 0
+}
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize system on startup"""
+    try:
+        logger.info("Starting Good Food to You meal planning system...")
+        
+        # Load configuration
+        config = load_config()
+        
+        # Initialize database connection
+        await db.initialize()
+        
+        # Health check on orchestrator
+        workflows = meal_planning_orchestrator.get_supported_workflows()
+        logger.info(f"Loaded {len(workflows)} workflow types: {workflows}")
+        
+        system_health["status"] = "healthy"
+        system_health["last_health_check"] = datetime.utcnow().isoformat()
+        
+        logger.info("System startup completed successfully")
+        
+    except Exception as e:
+        logger.error(f"System startup failed: {str(e)}")
+        system_health["status"] = "unhealthy"
+        raise
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    logger.info("Shutting down meal planning system...")
+    await db.close()
+    logger.info("System shutdown completed")
+
+# API Endpoints
+
+@app.get("/health")
+async def health_check():
+    """System health check endpoint"""
+    system_health["last_health_check"] = datetime.utcnow().isoformat()
+    return system_health
+
+@app.get("/workflows")
+async def get_workflows():
+    """Get available workflow types and their definitions"""
+    workflows = {}
+    for workflow_type in meal_planning_orchestrator.get_supported_workflows():
+        workflows[workflow_type] = meal_planning_orchestrator.get_workflow_definition(workflow_type)
+    
+    return {
+        "available_workflows": workflows,
+        "default_workflow": "full_meal_plan"
+    }
+
+@app.post("/meal-plan/generate")
+async def generate_meal_plan(
+    request: MealPlanRequest,
+    background_tasks: BackgroundTasks
+):
+    """Generate a new meal plan for a user"""
+    try:
+        system_health["total_requests"] += 1
+        system_health["active_workflows"] += 1
+        
+        logger.info(f"Generating meal plan for user {request.user_id}")
+        
+        # Prepare request data
+        request_data = {
+            "plan_days": request.plan_days,
+            "preferences": request.preferences
+        }
+        
+        if request.dietary_requirements:
+            request_data["dietary_requirements"] = request.dietary_requirements
+        
+        if request.cooking_constraints:
+            request_data["cooking_constraints"] = request.cooking_constraints
+        
+        if request.inventory_update:
+            request_data["inventory_update"] = request.inventory_update
+        
+        # Execute workflow
+        result = await meal_planning_orchestrator.execute_meal_planning_workflow(
+            user_id=request.user_id,
+            request_data=request_data,
+            workflow_type="full_meal_plan"
+        )
+        
+        system_health["active_workflows"] -= 1
+        
+        if result["status"] == WorkflowStatus.FAILED.value:
+            raise HTTPException(status_code=500, detail=result.get("error", "Meal planning failed"))
+        
+        # Schedule background tasks for analytics
+        background_tasks.add_task(log_meal_plan_generation, request.user_id, result)
+        
+        return {
+            "success": True,
+            "workflow_id": result["workflow_id"],
+            "status": result["status"],
+            "meal_plan": result.get("meal_plan"),
+            "shopping_list": result.get("shopping_list"),
+            "nutrition_analysis": result.get("nutrition_analysis"),
+            "execution_time": result.get("execution_time"),
+            "metadata": result.get("metadata", {})
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        system_health["active_workflows"] -= 1
+        logger.error(f"Error generating meal plan: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.post("/feedback")
+async def submit_feedback(request: FeedbackRequest):
+    """Submit user feedback for learning and improvement"""
+    try:
+        logger.info(f"Processing feedback from user {request.user_id}")
+        
+        result = await meal_planning_orchestrator.process_user_feedback(
+            user_id=request.user_id,
+            feedback_data={
+                "type": request.feedback_type,
+                "data": request.feedback_data,
+                "source": request.source
+            },
+            meal_plan_id=request.meal_plan_id
+        )
+        
+        return {
+            "success": result.get("success", True),
+            "feedback_processed": True,
+            "workflow_id": result.get("workflow_id"),
+            "message": "Feedback received and processed for system improvement"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing feedback: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Feedback processing error: {str(e)}")
+
+@app.post("/inventory/update")
+async def update_inventory(request: InventoryUpdateRequest):
+    """Update user's food inventory"""
+    try:
+        logger.info(f"Updating inventory for user {request.user_id}")
+        
+        result = await meal_planning_orchestrator.execute_meal_planning_workflow(
+            user_id=request.user_id,
+            request_data={
+                "inventory_data": request.inventory_data,
+                "update_type": request.update_type
+            },
+            workflow_type="inventory_update"
+        )
+        
+        return {
+            "success": True,
+            "inventory_updated": True,
+            "workflow_id": result["workflow_id"],
+            "status": result["status"],
+            "updated_inventory": result.get("inventory_status")
+        }
+        
+    except Exception as e:
+        logger.error(f"Error updating inventory: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Inventory update error: {str(e)}")
+
+@app.post("/recipe/generate")
+async def generate_quick_recipe(request: QuickRecipeRequest):
+    """Generate a quick recipe based on criteria"""
+    try:
+        logger.info(f"Generating quick recipe for user {request.user_id}")
+        
+        request_data = {
+            "recipe_request": request.recipe_criteria
+        }
+        
+        if request.available_ingredients:
+            request_data["available_ingredients"] = request.available_ingredients
+        
+        result = await meal_planning_orchestrator.execute_meal_planning_workflow(
+            user_id=request.user_id,
+            request_data=request_data,
+            workflow_type="quick_recipe"
+        )
+        
+        return {
+            "success": True,
+            "workflow_id": result["workflow_id"],
+            "recipe": result.get("recipe_data"),
+            "nutrition_info": result.get("nutrition_analysis"),
+            "ingredient_availability": result.get("inventory_status")
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating recipe: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Recipe generation error: {str(e)}")
+
+@app.get("/workflow/{workflow_id}/status")
+async def get_workflow_status(workflow_id: str):
+    """Get the status of a specific workflow execution"""
+    try:
+        status = await meal_planning_orchestrator.get_workflow_status(workflow_id)
+        return status
+        
+    except Exception as e:
+        logger.error(f"Error getting workflow status: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Status retrieval error: {str(e)}")
+
+@app.get("/user/{user_id}/profile")
+async def get_user_profile(user_id: str):
+    """Get user profile information"""
+    try:
+        profile = await db.get_user_profile(user_id)
+        if not profile:
+            raise HTTPException(status_code=404, detail="User profile not found")
+        
+        return {
+            "user_id": user_id,
+            "profile": profile.to_dict() if hasattr(profile, 'to_dict') else profile
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving user profile: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Profile retrieval error: {str(e)}")
+
+@app.post("/user/{user_id}/profile")
+async def update_user_profile(user_id: str, profile_data: Dict[str, Any]):
+    """Update user profile information"""
+    try:
+        await db.update_user_profile(user_id, profile_data)
+        
+        return {
+            "success": True,
+            "user_id": user_id,
+            "message": "Profile updated successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error updating user profile: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Profile update error: {str(e)}")
+
+# Background task functions
+async def log_meal_plan_generation(user_id: str, result: Dict[str, Any]):
+    """Background task to log meal plan generation for analytics"""
+    try:
+        # Log analytics data
+        analytics_data = {
+            "user_id": user_id,
+            "workflow_id": result["workflow_id"],
+            "status": result["status"],
+            "execution_time": result.get("execution_time"),
+            "timestamp": datetime.utcnow().isoformat(),
+            "meal_count": len(result.get("meal_plan", {}).get("meals", [])) if result.get("meal_plan") else 0
+        }
+        
+        # Store analytics (implementation depends on your analytics system)
+        # await analytics.log_meal_plan_generation(analytics_data)
+        
+        logger.info(f"Logged meal plan generation analytics for user {user_id}")
+        
+    except Exception as e:
+        logger.error(f"Error logging analytics: {str(e)}")
+
+# CLI Interface
+class CLIHandler:
+    """Command-line interface handler"""
+    
+    def __init__(self):
+        self.orchestrator = meal_planning_orchestrator
+    
+    async def handle_meal_plan_command(self, args):
+        """Handle meal plan generation from CLI"""
+        print(f"Generating meal plan for user: {args.user_id}")
+        
+        request_data = {
+            "plan_days": args.days,
+            "preferences": json.loads(args.preferences) if args.preferences else {}
+        }
+        
+        result = await self.orchestrator.execute_meal_planning_workflow(
+            user_id=args.user_id,
+            request_data=request_data,
+            workflow_type="full_meal_plan"
+        )
+        
+        self._print_result(result)
+    
+    async def handle_recipe_command(self, args):
+        """Handle recipe generation from CLI"""
+        print(f"Generating recipe for user: {args.user_id}")
+        
+        request_data = {
+            "recipe_request": json.loads(args.criteria) if args.criteria else {}
+        }
+        
+        result = await self.orchestrator.execute_meal_planning_workflow(
+            user_id=args.user_id,
+            request_data=request_data,
+            workflow_type="quick_recipe"
+        )
+        
+        self._print_result(result)
+    
+    def _print_result(self, result):
+        """Pretty print CLI results"""
+        print("\n" + "="*60)
+        print(f"Workflow ID: {result.get('workflow_id')}")
+        print(f"Status: {result.get('status')}")
+        print(f"Execution Time: {result.get('execution_time', 0):.2f}s")
+        
+        if result.get("meal_plan"):
+            print("\nMeal Plan Generated:")
+            meal_plan = result["meal_plan"]
+            for meal in meal_plan.get("meals", []):
+                print(f"  Day {meal.get('day')}: {meal.get('meal_type')} - {meal.get('recipe', {}).get('name')}")
+        
+        if result.get("shopping_list"):
+            print("\nShopping List:")
+            for item in result["shopping_list"][:5]:  # Show first 5 items
+                print(f"  - {item}")
+        
+        print("="*60)
+
+def create_cli_parser():
+    """Create command-line argument parser"""
+    parser = argparse.ArgumentParser(
+        description="Good Food to You - AI Meal Planning System",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    
+    # Server command
+    server_parser = subparsers.add_parser('server', help='Start the API server')
+    server_parser.add_argument('--host', default='127.0.0.1', help='Host to bind to')
+    server_parser.add_argument('--port', type=int, default=8000, help='Port to bind to')
+    server_parser.add_argument('--reload', action='store_true', help='Enable auto-reload')
+    
+    # Meal plan command
+    meal_parser = subparsers.add_parser('meal-plan', help='Generate a meal plan')
+    meal_parser.add_argument('user_id', help='User ID')
+    meal_parser.add_argument('--days', type=int, default=7, help='Number of days for the plan')
+    meal_parser.add_argument('--preferences', help='Preferences as JSON string')
+    
+    # Recipe command
+    recipe_parser = subparsers.add_parser('recipe', help='Generate a quick recipe')
+    recipe_parser.add_argument('user_id', help='User ID')
+    recipe_parser.add_argument('--criteria', help='Recipe criteria as JSON string')
+    
+    # Health check command
+    subparsers.add_parser('health', help='Check system health')
+    
+    # List workflows command
+    subparsers.add_parser('workflows', help='List available workflows')
+    
+    return parser
+
+async def main():
+    """Main entry point"""
+    parser = create_cli_parser()
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        return
+    
+    try:
+        if args.command == 'server':
+            # Start FastAPI server
+            print(f"Starting Good Food to You API server on {args.host}:{args.port}")
+            uvicorn.run(
+                "main:app",
+                host=args.host,
+                port=args.port,
+                reload=args.reload,
+                log_level="info"
+            )
+        
+        elif args.command == 'health':
+            # Simple health check
+            workflows = meal_planning_orchestrator.get_supported_workflows()
+            print(f"System Status: Healthy")
+            print(f"Available Workflows: {len(workflows)}")
+            print(f"Workflows: {', '.join(workflows)}")
+        
+        elif args.command == 'workflows':
+            # List workflows
+            workflows = meal_planning_orchestrator.get_supported_workflows()
+            print("Available Workflows:")
+            for workflow in workflows:
+                definition = meal_planning_orchestrator.get_workflow_definition(workflow)
+                print(f"\n{workflow}:")
+                for step in definition:
+                    print(f"  - {step['agent_type']} (priority: {step['priority']})")
+        
+        elif args.command in ['meal-plan', 'recipe']:
+            # Initialize system for CLI operations
+            await db.initialize()
+            
+            cli = CLIHandler()
+            
+            if args.command == 'meal-plan':
+                await cli.handle_meal_plan_command(args)
+            elif args.command == 'recipe':
+                await cli.handle_recipe_command(args)
+            
+            await db.close()
+        
+        else:
+            parser.print_help()
+    
+    except KeyboardInterrupt:
+        print("\nOperation cancelled by user")
+    except Exception as e:
+        logger.error(f"Error in main: {str(e)}")
+        print(f"Error: {str(e)}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    asyncio.run(main())
