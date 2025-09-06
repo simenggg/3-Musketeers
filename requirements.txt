@@ -1,2 +1,8 @@
 boto3
+duckduckgo_search
 python-dotenv
+strands-agents 
+strands-agents-tools[mem0_memory]
+uv
+streamlit
+strands-agents[litellm]
