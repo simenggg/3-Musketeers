@@ -1,17 +1,24 @@
 """
-# Recipe Assistant - AI-Powered Fridge Management
+# Some Good Food: A RecipeBot for Your Fridge
 
 ## 🍳 Overview
 
-The Recipe Assistant is an intelligent fridge management system that uses Agentic AI to help users:
-- Track food inventory with smart expiry management
-- Generate recipes prioritizing expiring ingredients
-- Plan weekly meals to reduce food waste
-- Learn user preferences and cooking patterns
+This project implements a RecipeBot agent that provides cooking recipes and meal ideas based on user preferences. The agent utilizes the Strands framework and integrates with various tools to enhance its capabilities.
+
+## Goal
+- To reduce **food wastage** through smarter meal planning.
+- To reduce **pressure on households**, especially elderly and working adults.
+
+## Feature:
+- **Recipe Generation**: Provides recipes and cooking tips.
+- **Expiry Priorization**: Recipe generated prioritize items that are expiring soon.
+- **Dietary Preferences**: Considers user dietary restrictions and preferences.
+- **Meal Planning**: Plan weekly meals to reduce food waste.
+
 
 ## 🏗️ Architecture
 
-### Clean Code Structure
+### Code Structure
 ```
 src/
 ├── main.py                 # Entry point
@@ -33,7 +40,6 @@ src/
 #### **Models**
 - `FridgeItem`: Represents food items with expiry intelligence
 - `Recipe`: Recipe structure with metadata
-- `UserProfile`: User preferences and history
 
 #### **Agent System**
 - `RecipeAgent`: Orchestrates AI responses with memory context
@@ -62,7 +68,6 @@ src/
 ### **Waste Reduction**
 - Weekly meal planning
 - Expiry-based prioritization
-- Smart shopping suggestions
 
 ## 🧪 Testing Strategy
 
@@ -71,7 +76,6 @@ Unlike traditional ML metrics (Precision/Recall), we measure:
 - **Recipe Relevance**: Do suggestions match available ingredients?
 - **Preference Alignment**: Does AI learn user preferences?
 - **Waste Reduction**: Are expiring ingredients prioritized?
-- **User Satisfaction**: Qualitative feedback on recipe quality
 
 ### **Test Data Preparation**
 - Synthetic fridge inventories with known expiry patterns
@@ -88,7 +92,18 @@ Unlike traditional ML metrics (Precision/Recall), we measure:
 ## 🛠️ Installation & Usage
 
 ### Prerequisites
+- Python 3.10+
+- uv or pip package manager
+- virtual environment (recommended)
+
+#### Installation
 ```bash
+# Create and activate virtual environment
+python -m venv venv
+source venv/bin/activate  # On Mac
+venv\Scripts\activate     # On Windows
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
@@ -148,4 +163,4 @@ This project showcases:
 ---
 
 *This project demonstrates production-ready Agentic AI with clean architecture, comprehensive testing, and real business value.*
-"""
+
