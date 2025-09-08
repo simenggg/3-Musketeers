@@ -1,4 +1,3 @@
-"""
 # Some Good Food: A RecipeBot for Your Fridge
 
 ## 🍳 Overview

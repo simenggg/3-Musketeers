@@ -1,4 +1,4 @@
-"""Streamlit UI for RecipeBot - Simple prototype interface."""
+"""Streamlit UI for Some Good Food - Simple prototype interface."""
 
 import streamlit as st
 import threading
