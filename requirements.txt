@@ -6,3 +6,12 @@ strands-agents-tools[mem0_memory]
 uv
 streamlit
 strands-agents[litellm]
+mcp
+requests
+urllib3
+python-dateutil
+pytest
+pytest-cov
+black
+flake8
+mypy
