@@ -108,9 +108,22 @@ pip install -r requirements.txt
 ```
 
 ### Running the Application
+
+#### Command Line Interface
 ```bash
 python -m src.main
 ```
+
+#### Web UI (Streamlit)
+```bash
+# Option 1: Direct streamlit command
+streamlit run streamlit_app.py
+
+# Option 2: Using the runner script
+python run_ui.py
+```
+
+The web UI will be available at http://localhost:8501
 
 ### Running Tests
 ```bash
