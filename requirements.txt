@@ -6,7 +6,7 @@ strands-agents-tools[mem0_memory]
 uv
 streamlit
 strands-agents[litellm]
-mcp
+mcp>=1.28,<2
 requests
 urllib3
 python-dateutil
